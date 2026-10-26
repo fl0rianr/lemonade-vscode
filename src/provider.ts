@@ -11,6 +11,7 @@ import {
 
 import { convertTools, convertMessages, tryParseJSONObject, validateRequest } from "./utils";
 import type { LemonadeEndpoint, LemonadeModel, LemonadeModelsResponse } from "./types";
+import { resolveModelContextLengths } from "./modelContext";
 
 const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
 const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
@@ -117,24 +118,34 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			endpoints.map(async (ep) => {
 				try {
 					const models = await this.fetchModels(ep);
-					return { ep, models };
+					const contextSignal = AbortSignal.timeout(2500);
+					const contextLengths = await resolveModelContextLengths(
+						models, fallbackContextLength, async (path) => {
+							const response = await fetch(`${ep.url}${path}`, {
+								method: "GET",
+								headers: {
+									Authorization: `Bearer ${ep.apiKey || DEFAULT_API_KEY}`,
+									"User-Agent": this.userAgent,
+								},
+								signal: contextSignal,
+							});
+							return response.ok ? response.json() : undefined;
+						}
+					);
+					return { ep, models, contextLengths };
 				} catch {
-					return { ep, models: [] as LemonadeModel[] };
+					return { ep, models: [] as LemonadeModel[], contextLengths: [] as number[] };
 				}
 			})
 		);
 
 		const infos: LanguageModelChatInformation[] = [];
-		for (const { ep, models } of results) {
-			for (const model of models) {
+		for (const { ep, models, contextLengths } of results) {
+			for (const [index, model] of models.entries()) {
 				const id = `${ep.shortname}/${model.id}`;
-				const rawCtxSize = model?.recipe_options?.ctx_size;
-				const contextLength =
-					typeof rawCtxSize === "number" && Number.isFinite(rawCtxSize) && rawCtxSize > 0
-						? rawCtxSize
-						: fallbackContextLength;
-				// maxInputTokens + maxOutputTokens must not exceed the model's context window
-				const maxOutput = Math.min(DEFAULT_MAX_OUTPUT_TOKENS, Math.max(1, contextLength - 1));
+				const contextLength = contextLengths[index];
+				// Preserve a usable input budget even when auto-tuning selects a small context.
+				const maxOutput = Math.min(DEFAULT_MAX_OUTPUT_TOKENS, Math.max(1, Math.floor(contextLength / 2)));
 				const maxInput = Math.max(1, contextLength - maxOutput);
 				infos.push({
 					id,
